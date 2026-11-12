@@ -292,6 +292,37 @@ Options:
   --har                           Save all requests to trace.har file
   --har-zip                       Save all requests to trace.har.zip file
   --har-file FILE                 Path to HAR file to save all requests
+  --manifest FILE                 Write a JSON manifest of shot results to this
+                                  file
   --help                          Show this message and exit.
 ```
 <!-- [[[end]]] -->
+
+## Validation, manifests and atomic output
+
+Before running any `sh:`, `python:` or `server:` steps, `shot-scraper multi` validates the entire configuration: every item must be a mapping using known keys with correctly typed values, every `js_file:` reference must exist and be readable, and every output filename - explicit or derived from the URL - must be unique across the shots that will run. If anything is invalid the command exits with an error before causing any side effects.
+
+Each shot runs against a fresh page, so page state (viewport size, injected elements, JavaScript globals) never leaks between shots. Cookies and other authentication state from `-a/--auth` are shared by all shots, as is any cookie set by a `javascript:` step.
+
+If an individual shot fails - for example because of a timeout or an unreachable page - the failure is recorded and the remaining shots still run. The `--fail` option keeps its existing behavior: the run aborts with a non-zero exit code on the first failure.
+
+Screenshots are written to a temporary file first and only moved to their final output path once complete, so a failed shot never leaves a partial file behind.
+
+Every run writes a JSON manifest (default `manifest.json`, override with `--manifest`) listing each shot's URL, output, status (`success`, `skipped`, `failed` or `pending`) and a reason for anything that did not succeed:
+
+```json
+{
+  "shots": [
+    {
+      "index": 1,
+      "output": "example.png",
+      "reason": null,
+      "status": "success",
+      "url": "http://www.example.com/"
+    }
+  ],
+  "summary": {
+    "success": 1
+  }
+}
+```

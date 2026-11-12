@@ -3,6 +3,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import json
@@ -827,6 +828,13 @@ def _convert_video_to_mp4(output, silent=False):
     type=click.Path(file_okay=True, writable=True, dir_okay=False),
     help="Path to HAR file to save all requests",
 )
+@click.option(
+    "manifest_path",
+    "--manifest",
+    type=click.Path(file_okay=True, writable=True, dir_okay=False),
+    default="manifest.json",
+    help="Write a JSON manifest of shot results to this file",
+)
 def multi(
     config,
     auth,
@@ -850,6 +858,7 @@ def multi(
     har,
     har_zip,
     har_file,
+    manifest_path,
 ):
     """
     Take multiple screenshots, defined by a YAML file
@@ -876,18 +885,42 @@ def multi(
     scale_factor = normalize_scale_factor(retina, scale_factor)
     shots = yaml.safe_load(config)
 
-    # Special case: if we are recording a har_file output can be blank to skip a shot
-    if har_file:
-        for shot in shots:
-            if not shot.get("output"):
-                shot["skip_shot"] = True
-
-    server_processes = []
-    server_needs_ready_check = False
     if shots is None:
         shots = []
     if not isinstance(shots, list):
         raise click.ClickException("YAML file must contain a list")
+    if skip and fail:
+        raise click.ClickException("--skip and --fail cannot be used together")
+
+    # Special case: if we are recording a har_file output can be blank to skip a shot
+    if har_file:
+        for shot in shots:
+            if isinstance(shot, dict) and not shot.get("output"):
+                shot["skip_shot"] = True
+
+    # Compile and validate the full configuration - referenced files, output
+    # naming and conflicts - before running any commands or starting servers
+    plans = _compile_multi_shots(
+        shots,
+        noclobber=noclobber,
+        outputs=outputs,
+        manifest_path=manifest_path,
+    )
+    manifest = {
+        "shots": [
+            {
+                "index": plan["index"],
+                "url": plan["url"],
+                "output": plan["output"],
+                "status": "pending",
+                "reason": None,
+            }
+            for plan in plans
+        ]
+    }
+
+    server_processes = []
+    server_needs_ready_check = False
     with sync_playwright() as p:
         context, browser_obj = _browser_context(
             p,
@@ -903,15 +936,12 @@ def multi(
             record_har_path=har_file or None,
         )
         try:
-            for shot in shots:
-                if (
-                    noclobber
-                    and shot.get("output")
-                    and pathlib.Path(shot["output"]).exists()
-                ):
+            for plan, entry in zip(plans, manifest["shots"]):
+                if plan["skip_reason"]:
+                    entry["status"] = "skipped"
+                    entry["reason"] = plan["skip_reason"]
                     continue
-                if outputs and shot.get("output") and shot.get("output") not in outputs:
-                    continue
+                shot = plan["shot"]
                 # Run "sh" key
                 if shot.get("sh"):
                     _run_sh_command(shot["sh"])
@@ -922,35 +952,252 @@ def multi(
                     # Start that subprocess and remember the pid
                     server_processes.append(_start_server(shot["server"]))
                     server_needs_ready_check = True
-                if "url" in shot:
-                    if server_needs_ready_check:
-                        _wait_for_server(
-                            server_processes,
-                            url_or_file_path(shot["url"], _check_and_absolutize),
-                        )
-                        server_needs_ready_check = False
-                    try:
-                        take_shot(
-                            context,
-                            shot,
-                            log_console=log_console,
-                            skip=skip,
-                            fail=fail,
-                            silent=silent,
-                        )
-                    except TimeoutError as e:
-                        if fail or fail_on_error:
-                            raise click.ClickException(str(e))
-                        else:
-                            click.echo(str(e), err=True)
-                            continue
+                if "url" not in shot:
+                    entry["status"] = "success"
+                    continue
+                if server_needs_ready_check:
+                    _wait_for_server(
+                        server_processes,
+                        url_or_file_path(shot["url"], _check_and_absolutize),
+                    )
+                    server_needs_ready_check = False
+                try:
+                    result = take_shot(
+                        context,
+                        shot,
+                        log_console=log_console,
+                        skip=skip,
+                        fail=fail,
+                        silent=silent,
+                    )
+                except Exception as e:
+                    entry["status"] = "failed"
+                    entry["reason"] = str(e)
+                    if fail or fail_on_error:
+                        raise click.ClickException(str(e))
+                    click.echo(str(e), err=True)
+                    continue
+                if result == "skipped":
+                    entry["status"] = "skipped"
+                    if shot.get("skip_shot"):
+                        entry["reason"] = "screenshot skipped (skip_shot)"
+                    else:
+                        entry["reason"] = "HTTP error, skipped (--skip)"
+                else:
+                    entry["status"] = "success"
         finally:
             context.close()
             browser_obj.close()
             if server_processes:
                 _cleanup_servers(server_processes, leave_server)
+            _write_manifest(manifest_path, manifest)
             if har_file and not silent:
                 click.echo(f"Wrote to HAR file: {har_file}", err=True)
+
+
+MULTI_SHOT_KEYS = {
+    "url",
+    "output",
+    "sh",
+    "python",
+    "server",
+    "selector",
+    "selectors",
+    "selector_all",
+    "selectors_all",
+    "js_selector",
+    "js_selectors",
+    "js_selector_all",
+    "js_selectors_all",
+    "javascript",
+    "js_file",
+    "width",
+    "height",
+    "wait",
+    "wait_for",
+    "padding",
+    "format",
+    "quality",
+    "omit_background",
+    "skip_shot",
+}
+
+
+def _compile_multi_shots(shots, noclobber=False, outputs=(), manifest_path=None):
+    """
+    Validate and compile a shot list before any side effects occur.
+
+    Checks the structure of every shot, resolves javascript/js_file
+    references, freezes output filenames and detects output conflicts.
+
+    Returns a list of plan dicts with keys: index, shot, url, output,
+    skip_reason. Raises ClickException if anything is invalid.
+    """
+    plans = []
+    for index, shot in enumerate(shots, start=1):
+        if not isinstance(shot, dict):
+            raise click.ClickException(
+                f"Shot {index} must be a mapping, got {type(shot).__name__}"
+            )
+        unknown_keys = [key for key in shot if key not in MULTI_SHOT_KEYS]
+        if unknown_keys:
+            raise click.ClickException(
+                "Shot {} has unknown keys: {}".format(
+                    index, ", ".join(sorted(str(key) for key in unknown_keys))
+                )
+            )
+        for key in (
+            "url",
+            "output",
+            "javascript",
+            "js_file",
+            "wait_for",
+            "format",
+            "selector",
+            "selector_all",
+            "js_selector",
+            "js_selector_all",
+        ):
+            if key in shot and not isinstance(shot[key], str):
+                raise click.ClickException(f"Shot {index}: '{key}' must be a string")
+        for key in ("selectors", "selectors_all", "js_selectors", "js_selectors_all"):
+            if key in shot:
+                value = shot[key]
+                if not isinstance(value, list) or not all(
+                    isinstance(item, str) for item in value
+                ):
+                    raise click.ClickException(
+                        f"Shot {index}: '{key}' must be a list of strings"
+                    )
+        for key in ("sh", "server"):
+            if key in shot and not isinstance(shot[key], (str, list)):
+                raise click.ClickException(
+                    f"Shot {index}: '{key}' must be a string or list"
+                )
+        if "python" in shot and not isinstance(shot["python"], str):
+            raise click.ClickException(f"Shot {index}: 'python' must be a string")
+        for key in ("width", "height"):
+            if key in shot and (
+                not isinstance(shot[key], int) or isinstance(shot[key], bool)
+            ):
+                raise click.ClickException(f"Shot {index}: '{key}' must be an integer")
+        for key in ("wait", "padding"):
+            if key in shot and (
+                not isinstance(shot[key], (int, float)) or isinstance(shot[key], bool)
+            ):
+                raise click.ClickException(f"Shot {index}: '{key}' must be a number")
+
+        url = shot.get("url") or None
+        has_commands = any(key in shot for key in ("sh", "python", "server"))
+        if not url:
+            if shot.get("output"):
+                raise click.ClickException(f"Shot {index}: 'output' requires a 'url'")
+            if not has_commands:
+                raise click.ClickException(
+                    f"Shot {index}: must specify at least one of "
+                    "'url', 'sh', 'python' or 'server'"
+                )
+
+        compiled = dict(shot)
+        # Resolve javascript/js_file now so missing files fail before
+        # any commands or servers have been started
+        try:
+            javascript = _resolve_javascript(
+                shot.get("javascript"), shot.get("js_file")
+            )
+        except click.ClickException as ex:
+            raise click.ClickException(f"Shot {index}: {ex.message}")
+        compiled.pop("js_file", None)
+        if javascript:
+            compiled["javascript"] = javascript
+
+        output = (shot.get("output") or "").strip()
+        skip_reason = None
+        if output:
+            if noclobber and pathlib.Path(output).exists():
+                skip_reason = "output already exists (--no-clobber)"
+            elif outputs and output not in outputs:
+                skip_reason = "not selected by --output"
+
+        if url:
+            try:
+                format_ = _screenshot_format(
+                    output, shot.get("format"), shot.get("quality")
+                )
+            except click.ClickException as ex:
+                raise click.ClickException(f"Shot {index}: {ex.message}")
+            if not output and not shot.get("skip_shot"):
+                resolved_url = url_or_file_path(url, _check_and_absolutize)
+                output = filename_for_url(
+                    resolved_url,
+                    ext="jpg" if format_ == "jpeg" else format_,
+                    file_exists=os.path.exists,
+                )
+            if output:
+                if manifest_path:
+                    try:
+                        if (
+                            pathlib.Path(output).resolve()
+                            == pathlib.Path(manifest_path).resolve()
+                        ):
+                            raise click.ClickException(
+                                f"Shot {index}: output '{output}' conflicts "
+                                "with the manifest file"
+                            )
+                    except OSError:
+                        pass
+                compiled["output"] = output
+        plans.append(
+            {
+                "index": index,
+                "shot": compiled,
+                "url": url,
+                "output": output or None,
+                "skip_reason": skip_reason,
+            }
+        )
+
+    # Every output filename must be unique across the shots that will run
+    seen = {}
+    for plan in plans:
+        if plan["skip_reason"] or not plan["output"]:
+            continue
+        if plan["shot"].get("skip_shot"):
+            continue
+        seen.setdefault(plan["output"], []).append(plan["index"])
+    duplicates = {
+        output: indexes for output, indexes in seen.items() if len(indexes) > 1
+    }
+    if duplicates:
+        details = "; ".join(
+            "'{}' (shots {})".format(output, ", ".join(map(str, indexes)))
+            for output, indexes in sorted(duplicates.items())
+        )
+        raise click.ClickException(f"Duplicate output filenames: {details}")
+    return plans
+
+
+def _write_manifest(path, manifest):
+    "Write the shot manifest atomically, with a stable key order"
+    summary = {}
+    for entry in manifest["shots"]:
+        summary[entry["status"]] = summary.get(entry["status"], 0) + 1
+    manifest["summary"] = summary
+    payload = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    target = pathlib.Path(path)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=target.name + ".", suffix=".tmp", dir=str(target.parent)
+    )
+    try:
+        with os.fdopen(fd, "w") as fp:
+            fp.write(payload)
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 @cli.command()
@@ -2301,97 +2548,131 @@ def take_shot(
     else:
         page = context_or_page
 
-    if log_console:
-        page.on("console", console_log)
+    tmp_screenshot_path = None
+    try:
+        if log_console:
+            page.on("console", console_log)
 
-    viewport = _get_viewport(shot.get("width"), shot.get("height"))
-    if viewport:
-        page.set_viewport_size(viewport)
+        viewport = _get_viewport(shot.get("width"), shot.get("height"))
+        if viewport:
+            page.set_viewport_size(viewport)
 
-    full_page = not shot.get("height")
+        full_page = not shot.get("height")
 
-    if not use_existing_page:
-        # Load page and check for errors
-        response = page.goto(url)
-        # Check if page was a 404 or 500 or other error
-        if str(response.status)[0] in ("4", "5"):
-            if skip:
-                click.echo(f"{response.status} error for {url}, skipping", err=True)
-                return
-            elif fail:
-                raise click.ClickException(f"{response.status} error for {url}")
+        if not use_existing_page:
+            # Load page and check for errors
+            response = page.goto(url)
+            # Check if page was a 404 or 500 or other error
+            if str(response.status)[0] in ("4", "5"):
+                if skip:
+                    click.echo(f"{response.status} error for {url}, skipping", err=True)
+                    return "skipped"
+                elif fail:
+                    raise click.ClickException(f"{response.status} error for {url}")
 
-    if wait:
-        time.sleep(wait / 1000)
+        if wait:
+            time.sleep(wait / 1000)
 
-    javascript = _resolve_javascript(shot.get("javascript"), shot.get("js_file"))
-    if javascript:
-        _evaluate_js(page, javascript)
+        javascript = _resolve_javascript(shot.get("javascript"), shot.get("js_file"))
+        if javascript:
+            _evaluate_js(page, javascript)
 
-    if wait_for:
-        page.wait_for_function(wait_for)
+        if wait_for:
+            page.wait_for_function(wait_for)
 
-    screenshot_args = {}
-    if format_ is not None:
-        screenshot_args["type"] = format_
-    if quality is not None:
-        screenshot_args["quality"] = quality
-    if omit_background:
-        screenshot_args.update({"omit_background": True})
-    if not return_bytes:
-        screenshot_args["path"] = output
+        screenshot_args = {}
+        if format_ is not None:
+            screenshot_args["type"] = format_
+        if quality is not None:
+            screenshot_args["quality"] = quality
+        if omit_background:
+            screenshot_args.update({"omit_background": True})
+        if not return_bytes:
+            # Write to a temporary file first, then atomically publish it
+            # to the final output path once the screenshot is complete
+            tmp_screenshot_path = _temporary_path_for(output)
+            screenshot_args["path"] = tmp_screenshot_path
 
-    if (
-        not selectors
-        and not js_selectors
-        and not selectors_all
-        and not js_selectors_all
-    ):
-        screenshot_args["full_page"] = full_page
+        if (
+            not selectors
+            and not js_selectors
+            and not selectors_all
+            and not js_selectors_all
+        ):
+            screenshot_args["full_page"] = full_page
 
-    if js_selectors or js_selectors_all:
-        # Evaluate JavaScript adding classes we can select on
-        (
-            js_selector_javascript,
-            extra_selectors,
-            extra_selectors_all,
-        ) = _js_selector_javascript(js_selectors, js_selectors_all)
-        selectors.extend(extra_selectors)
-        selectors_all.extend(extra_selectors_all)
-        _evaluate_js(page, js_selector_javascript)
+        if js_selectors or js_selectors_all:
+            # Evaluate JavaScript adding classes we can select on
+            (
+                js_selector_javascript,
+                extra_selectors,
+                extra_selectors_all,
+            ) = _js_selector_javascript(js_selectors, js_selectors_all)
+            selectors.extend(extra_selectors)
+            selectors_all.extend(extra_selectors_all)
+            _evaluate_js(page, js_selector_javascript)
 
-    if selectors or selectors_all:
-        # Use JavaScript to create a box around those elementsdef
-        selector_javascript, selector_to_shoot = _selector_javascript(
-            selectors, selectors_all, padding
-        )
-        _evaluate_js(page, selector_javascript)
-        try:
-            bytes_ = page.locator(selector_to_shoot).screenshot(**screenshot_args)
-        except TimeoutError as e:
-            raise click.ClickException(
-                f"Timed out while waiting for element to become available.\n\n{e}"
+        status = "success"
+        if selectors or selectors_all:
+            # Use JavaScript to create a box around those elementsdef
+            selector_javascript, selector_to_shoot = _selector_javascript(
+                selectors, selectors_all, padding
             )
-        if return_bytes:
-            return bytes_
-        else:
-            page.locator(selector_to_shoot).screenshot(**screenshot_args)
-            message = "Screenshot of '{}' on '{}' written to '{}'".format(
-                ", ".join(list(selectors) + list(selectors_all)), url, output
-            )
-    else:
-        if shot.get("skip_shot"):
-            message = "Skipping screenshot of '{}'".format(url)
-        else:
-            # Whole page
+            _evaluate_js(page, selector_javascript)
+            try:
+                bytes_ = page.locator(selector_to_shoot).screenshot(**screenshot_args)
+            except TimeoutError as e:
+                raise click.ClickException(
+                    f"Timed out while waiting for element to become available.\n\n{e}"
+                )
             if return_bytes:
-                return page.screenshot(**screenshot_args)
+                return bytes_
             else:
-                page.screenshot(**screenshot_args)
-                message = f"Screenshot of '{url}' written to '{output}'"
+                page.locator(selector_to_shoot).screenshot(**screenshot_args)
+                message = "Screenshot of '{}' on '{}' written to '{}'".format(
+                    ", ".join(list(selectors) + list(selectors_all)), url, output
+                )
+        else:
+            if shot.get("skip_shot"):
+                message = "Skipping screenshot of '{}'".format(url)
+                status = "skipped"
+            else:
+                # Whole page
+                if return_bytes:
+                    return page.screenshot(**screenshot_args)
+                else:
+                    page.screenshot(**screenshot_args)
+                    message = f"Screenshot of '{url}' written to '{output}'"
 
-    if not silent:
-        click.echo(message, err=True)
+        if tmp_screenshot_path is not None and status == "success":
+            os.replace(tmp_screenshot_path, output)
+            tmp_screenshot_path = None
+        if not silent:
+            click.echo(message, err=True)
+        return status
+    finally:
+        if tmp_screenshot_path is not None:
+            try:
+                os.unlink(tmp_screenshot_path)
+            except OSError:
+                pass
+        if not use_existing_page:
+            try:
+                page.close()
+            except Error:
+                pass
+
+
+def _temporary_path_for(output):
+    "Return a temporary file path in the same directory, keeping the extension"
+    output_path = pathlib.Path(output)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=output_path.name + ".",
+        suffix=output_path.suffix,
+        dir=str(output_path.parent),
+    )
+    os.close(fd)
+    return tmp_path
 
 
 def _js_selector_javascript(js_selectors, js_selectors_all):

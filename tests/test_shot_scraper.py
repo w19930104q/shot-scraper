@@ -214,7 +214,26 @@ def test_multi_js_file():
             "- url: index.html\n  output: output.png\n  js_file: boom.js\n"
         )
         result = runner.invoke(cli, ["multi", "shots.yaml"])
-        # The error raised by the script proves it was loaded and executed
+        # The error raised by the script proves it was loaded and executed.
+        # The failure is recorded in the manifest and the run continues,
+        # so the exit code is 0 unless --fail is used.
+        assert result.exit_code == 0
+        assert "boom-marker" in result.output
+        manifest = json.loads(pathlib.Path("manifest.json").read_text())
+        assert manifest["shots"][0]["status"] == "failed"
+        assert "boom-marker" in manifest["shots"][0]["reason"]
+
+
+def test_multi_js_file_fail_option():
+    # With --fail a JavaScript error aborts the run with a non-zero exit code
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        open("index.html", "w").write("<h1>Original</h1>")
+        open("boom.js", "w").write("throw new Error('boom-marker')")
+        open("shots.yaml", "w").write(
+            "- url: index.html\n  output: output.png\n  js_file: boom.js\n"
+        )
+        result = runner.invoke(cli, ["multi", "shots.yaml", "--fail"])
         assert result.exit_code != 0
         assert "boom-marker" in result.output
 
